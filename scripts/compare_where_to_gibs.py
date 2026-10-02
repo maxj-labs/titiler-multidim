@@ -16,8 +16,11 @@ against the GIBS image of that scan on the same pixel grid, and against each
 other: the two branches should agree exactly, and each should match GIBS to
 the ~1% compare_to_gibs.py reports for the store itself.
 
-Run each branch locally (from a worktree of each, with the same Earthdata
-settings the deployment uses), then point the script at both:
+The default store is the public Source Coop mirror, read through its S3
+bucket. Its chunks are virtual references into ASDC's bucket, so each server
+needs Earthdata access for s3://asdc-prod-protected/ (see the README) and
+must run in us-west-2. Point the script at a deployment of each branch, or
+run each branch from a worktree on an in-region host:
 
     git worktree add ../where-dask feat/where-parameter
     git worktree add ../where-nodask feat/where-mask
@@ -46,7 +49,7 @@ from typing import Any
 import numpy as np
 
 GIBS = "https://gibs.earthdata.nasa.gov"
-STORE = "s3://airquality-data-store-develop/tempo/{collection}/v04"
+STORE = "s3://us-west-2.opendata.source.coop/pangeo/tempo-virtual-icechunk/tempo/{collection}/v04"
 # collection -> (store variable, GIBS layer, GIBS colormap)
 LAYERS = {
     "no2": (
@@ -68,6 +71,7 @@ WHERE = ["main_data_quality_flag<=1", "eff_cloud_fraction<0.5", "solar_zenith_an
 # ponytail: leap seconds fixed at 18 (true since 2017); add one if IERS ever does.
 GPS_MINUS_UTC = np.timedelta64(18, "s")
 NO_DATA, OFF_PALETTE = -1, -2
+MAX_PIXELS = 500_000  # per /bbox request; see titiler_values
 BRANCHES = ("nodask", "dask")
 
 
@@ -141,16 +145,28 @@ def titiler_values(
     api: str, params: dict[str, Any], bbox: list[float], shape: tuple[int, int]
 ) -> tuple[np.ndarray, float]:
     """The screened scan as titiler renders it, NaN where masked, south row
-    first, and the seconds the request took."""
-    corners = ",".join(f"{v:.6f}" for v in bbox)
-    start = clock.perf_counter()
-    raw = get(api, f"/bbox/{corners}/{shape[1]}x{shape[0]}.npy", **params)
-    seconds = clock.perf_counter() - start
+    first, and the seconds the requests took.
+
+    Read in strips of rows, north first: a Lambda response tops out at
+    6 MB and titiler's npy costs 8 bytes a pixel (float32 value and mask).
+    """
+    w, s, e, n = bbox
+    res = (n - s) / shape[0]
+    rows = max(1, MAX_PIXELS // shape[1])
+    strips, seconds = [], 0.0
+    # ponytail: strips fetched one after another so the time is comparable;
+    # thread them if a full-domain run is too slow
+    for top in range(0, shape[0], rows):
+        height = min(rows, shape[0] - top)
+        corners = f"{w:.6f},{n - (top + height) * res:.6f},{e:.6f},{n - top * res:.6f}"
+        start = clock.perf_counter()
+        raw = get(api, f"/bbox/{corners}/{shape[1]}x{height}.npy", **params)
+        seconds += clock.perf_counter() - start
+        strips.append(np.load(io.BytesIO(raw)))
     # titiler's npy is the bands followed by the mask (0 = masked)
-    data = np.load(io.BytesIO(raw))
-    return np.flipud(
-        np.where(data[-1] == 0, np.nan, data[0].astype("float64"))
-    ), seconds
+    data = np.concatenate(strips, axis=1)
+    values = np.where(data[-1] == 0, np.nan, data[0].astype("float64"))
+    return np.flipud(values), seconds
 
 
 def agreement(label: str, a: np.ndarray, b: np.ndarray, names: tuple[str, str]) -> int:
@@ -285,10 +301,10 @@ def main() -> int:
     w0, s0, e0, n0 = info["bounds"]
     res = (e0 - w0) / info["width"]
     w, s, e, n = args.bbox or (w0, s0, e0, n0)
-    w = w0 + np.floor((max(w, w0) - w0) / res + 1e-6) * res
-    s = s0 + np.floor((max(s, s0) - s0) / res + 1e-6) * res
-    e = w0 + np.ceil((min(e, e0) - w0) / res - 1e-6) * res
-    n = s0 + np.ceil((min(n, n0) - s0) / res - 1e-6) * res
+    w = w0 + np.floor((max(w, w0) - w0) / res + 1e-3) * res
+    s = s0 + np.floor((max(s, s0) - s0) / res + 1e-3) * res
+    e = w0 + np.ceil((min(e, e0) - w0) / res - 1e-3) * res
+    n = s0 + np.ceil((min(n, n0) - s0) / res - 1e-3) * res
     bbox = [float(w), float(s), float(e), float(n)]
     shape = (round((n - s) / res), round((e - w) / res))
 
