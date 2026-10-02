@@ -5,33 +5,27 @@
 #     "numpy",
 # ]
 # ///
-"""Compare the dask and dask-less where= branches against NASA GIBS.
+"""Compare titiler-multidim's where= rendering of TEMPO against NASA GIBS.
 
 Adapted from tempo-virtual-zarr-pipeline's scripts/compare_to_gibs.py, which
-reads the store directly. This one reads the same TEMPO scan through two
-running titiler-multidim servers, one on feat/where-parameter (dask) and one
-on feat/where-mask (no dask), applying GIBS's quality screen with where=
-instead of numpy. Both renders go through GIBS's colormap and are checked
-against the GIBS image of that scan on the same pixel grid, and against each
-other: the two branches should agree exactly, and each should match GIBS to
-the ~1% compare_to_gibs.py reports for the store itself.
+reads the store directly. This one reads the same TEMPO scan through a
+running titiler-multidim server on feat/where-mask, applying GIBS's quality
+screen with where= instead of numpy. The render goes through GIBS's colormap
+and sits beside the GIBS image of that scan on the same pixel grid, with a
+third panel of the per-pixel difference in colormap bins. It should match
+GIBS to the ~1% compare_to_gibs.py reports for the store itself.
 
 The default store is the public Source Coop mirror, read through its S3
-bucket. Its chunks are virtual references into ASDC's bucket, so each server
+bucket. Its chunks are virtual references into ASDC's bucket, so the server
 needs Earthdata access for s3://asdc-prod-protected/ (see the README) and
-must run in us-west-2. Point the script at a deployment of each branch, or
-run each branch from a worktree on an in-region host:
+must run in us-west-2: point the script at a deployment, or run the branch
+on an in-region host:
 
-    git worktree add ../where-dask feat/where-parameter
-    git worktree add ../where-nodask feat/where-mask
-    (cd ../where-dask && uv run uvicorn titiler.multidim.main:app --port 8001)
-    (cd ../where-nodask && uv run uvicorn titiler.multidim.main:app --port 8002)
+    uv run uvicorn titiler.multidim.main:app --port 8000
 
-    uv run scripts/compare_where_to_gibs.py --collection no2 \\
-        --dask http://localhost:8001 --nodask http://localhost:8002
-    uv run scripts/compare_where_to_gibs.py --collection hcho \\
-        --time 2026-10-01T18:00 --bbox -125 24 -66 50 \\
-        --dask http://localhost:8001 --nodask http://localhost:8002
+    uv run scripts/compare_where_to_gibs.py --api http://localhost:8000
+    uv run scripts/compare_where_to_gibs.py --api http://localhost:8000 \\
+        --collection hcho --time 2026-10-01T18:00 --bbox -125 24 -66 50
 """
 
 from __future__ import annotations
@@ -72,7 +66,6 @@ WHERE = ["main_data_quality_flag<=1", "eff_cloud_fraction<0.5", "solar_zenith_an
 GPS_MINUS_UTC = np.timedelta64(18, "s")
 NO_DATA, OFF_PALETTE = -1, -2
 MAX_PIXELS = 500_000  # per /bbox request; see titiler_values
-BRANCHES = ("nodask", "dask")
 
 
 def fetch(url: str) -> bytes:
@@ -145,7 +138,7 @@ def titiler_values(
     api: str, params: dict[str, Any], bbox: list[float], shape: tuple[int, int]
 ) -> tuple[np.ndarray, float]:
     """The screened scan as titiler renders it, NaN where masked, south row
-    first, and the seconds the requests took.
+    first, and the seconds the requests took (cold starts included).
 
     Read in strips of rows, north first: a Lambda response tops out at
     6 MB and titiler's npy costs 8 bytes a pixel (float32 value and mask).
@@ -154,8 +147,8 @@ def titiler_values(
     res = (n - s) / shape[0]
     rows = max(1, MAX_PIXELS // shape[1])
     strips, seconds = [], 0.0
-    # ponytail: strips fetched one after another so the time is comparable;
-    # thread them if a full-domain run is too slow
+    # ponytail: strips fetched one after another; thread them if a
+    # full-domain run is too slow
     for top in range(0, shape[0], rows):
         height = min(rows, shape[0] - top)
         corners = f"{w:.6f},{n - (top + height) * res:.6f},{e:.6f},{n - top * res:.6f}"
@@ -169,88 +162,54 @@ def titiler_values(
     return np.flipud(values), seconds
 
 
-def agreement(label: str, a: np.ndarray, b: np.ndarray, names: tuple[str, str]) -> int:
-    """Print how bins ``a`` and ``b`` agree; return the pixels both draw."""
-    both = (a >= 0) & (b >= 0)
-    diff = np.abs(a - b)[both]
-    counts = {
-        "both": int(both.sum()),
-        f"{names[0]} only": int(((a >= 0) & (b == NO_DATA)).sum()),
-        f"{names[1]} only": int(((a == NO_DATA) & (b != NO_DATA)).sum()),
-    }
-    if (b == OFF_PALETTE).any():
-        counts[f"{names[1]} off-palette"] = int((b == OFF_PALETTE).sum())
-    print(f"  {label}: " + ", ".join(f"{k} {v:,}" for k, v in counts.items()))
-    if diff.size:
-        print(
-            f"    same bin {np.mean(diff == 0):.1%}, within 1 bin {np.mean(diff <= 1):.1%}"
-        )
-    return counts["both"]
-
-
 def plot(
     path: str,
     title: str,
     gibs: np.ndarray,
     gibs_bin: np.ndarray,
-    bins: dict[str, np.ndarray],
+    store_bin: np.ndarray,
     colors: np.ndarray,
     extent: list[float],
 ) -> None:
-    """Write GIBS, both branches, and their differences to ``path``."""
+    """Write GIBS, the titiler render, and their difference to ``path``."""
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.colors import ListedColormap
 
+    both = (gibs_bin >= 0) & (store_bin >= 0)
+    diff = np.ma.masked_where(~both, store_bin - gibs_bin)
+    coverage = np.zeros(gibs_bin.shape + (4,))
+    coverage[(store_bin >= 0) & (gibs_bin == NO_DATA)] = (0.95, 0.55, 0.1, 1)
+    coverage[(store_bin == NO_DATA) & (gibs_bin != NO_DATA)] = (0, 0, 0, 1)
+
+    fig, axes = plt.subplots(3, 1, figsize=(14, 17), constrained_layout=True)
     show: dict[str, Any] = {
         "origin": "lower",
         "extent": extent,
         "interpolation": "nearest",
     }
-
-    def difference(ax: Any, a: np.ndarray, b: np.ndarray, label: str) -> Any:
-        both = (a >= 0) & (b >= 0)
-        coverage = np.zeros(a.shape + (4,))
-        coverage[(a >= 0) & (b == NO_DATA)] = (0.95, 0.55, 0.1, 1)
-        coverage[(a == NO_DATA) & (b != NO_DATA)] = (0, 0, 0, 1)
-        image = ax.imshow(
-            np.ma.masked_where(~both, a - b), cmap="RdBu_r", vmin=-5, vmax=5, **show
-        )
-        ax.imshow(coverage, **show)
-        ax.set_title(label)
-        return image
-
-    fig, axes = plt.subplots(3, 2, figsize=(24, 17), constrained_layout=True)
-    axes[0, 0].imshow(gibs, **show)
-    axes[0, 0].set_title("GIBS (what Worldview shows)")
-    difference(
-        axes[0, 1],
-        bins["dask"],
-        bins["nodask"],
-        "dask bin − dask-less bin   (orange: dask only, black: dask-less only)",
-    )
+    axes[0].imshow(gibs, **show)
+    axes[0].set_title("GIBS (what Worldview shows)")
     palette = ListedColormap(colors / 255)
-    for row, branch in enumerate(BRANCHES, start=1):
-        axes[row, 0].imshow(
-            np.ma.masked_less(bins[branch], 0),
-            cmap=palette,
-            vmin=0,
-            vmax=len(colors) - 1,
-            **show,
-        )
-        axes[row, 0].set_title(f"titiler {branch}, where= screen, GIBS colormap")
-        image = difference(
-            axes[row, 1],
-            bins[branch],
-            gibs_bin,
-            f"{branch} bin − GIBS bin   (orange: {branch} only, black: GIBS only)",
-        )
-    fig.colorbar(
-        image, ax=axes[:, 1], location="bottom", shrink=0.4, label="colormap bins"
+    axes[1].imshow(
+        np.ma.masked_less(store_bin, 0),
+        cmap=palette,
+        vmin=0,
+        vmax=len(colors) - 1,
+        **show,
     )
-    for ax in axes.flat:
+    axes[1].set_title("titiler-multidim, where= screen, GIBS colormap")
+    image = axes[2].imshow(diff, cmap="RdBu_r", vmin=-5, vmax=5, **show)
+    axes[2].imshow(coverage, **show)
+    axes[2].set_title(
+        "titiler bin − GIBS bin   (orange: titiler only, black: GIBS only)"
+    )
+    fig.colorbar(
+        image, ax=axes[2], location="bottom", shrink=0.4, label="colormap bins"
+    )
+    for ax in axes:
         ax.set_facecolor("#dddddd")
         ax.set_aspect(1 / np.cos(np.deg2rad((extent[2] + extent[3]) / 2)))
     fig.suptitle(title)
@@ -259,10 +218,9 @@ def plot(
 
 
 def main() -> int:
-    """Compare both branches with GIBS for one scan."""
+    """Compare titiler's render of one scan with GIBS."""
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--dask", required=True, help="API on feat/where-parameter")
-    parser.add_argument("--nodask", required=True, help="API on feat/where-mask")
+    parser.add_argument("--api", required=True, help="titiler-multidim base URL")
     parser.add_argument("--collection", choices=sorted(LAYERS), default="no2")
     parser.add_argument("--url", help=f"store (default: {STORE})")
     parser.add_argument(
@@ -278,7 +236,7 @@ def main() -> int:
     variable, layer, colormap = LAYERS[args.collection]
     url = args.url or STORE.format(collection=args.collection)
     info = json.loads(
-        get(args.nodask, "/info", url=url, variable=variable, show_times="true")
+        get(args.api, "/info", url=url, variable=variable, show_times="true")
     )
 
     # Worldview shows the scan whose start precedes the time, not the nearest;
@@ -318,29 +276,42 @@ def main() -> int:
         "where": WHERE,
     }
     print(f"{args.collection} scan {utc}Z  {layer}  {shape[1]}x{shape[0]} px")
-    bins, common = {}, 0
-    for branch in BRANCHES:
-        values, seconds = titiler_values(getattr(args, branch), params, bbox, shape)
-        bins[branch] = value_bins(values, edges)
-        print(f"  {branch}: {seconds:.1f}s")
-        common += agreement(
-            f"{branch} vs GIBS", bins[branch], gibs_bin, (branch, "GIBS")
-        )
-    agreement("dask vs dask-less", bins["dask"], bins["nodask"], ("dask", "dask-less"))
-    identical = np.array_equal(bins["dask"], bins["nodask"])
-    print(f"  dask and dask-less bins {'identical' if identical else 'DIFFER'}")
+    values, seconds = titiler_values(args.api, params, bbox, shape)
+    store_bin = value_bins(values, edges)
+
+    both = (gibs_bin >= 0) & (store_bin >= 0)
+    diff = np.abs(store_bin - gibs_bin)[both]
+    counts = {
+        "both": int(both.sum()),
+        "titiler only": int(((store_bin >= 0) & (gibs_bin == NO_DATA)).sum()),
+        "GIBS only": int(((store_bin == NO_DATA) & (gibs_bin != NO_DATA)).sum()),
+        "GIBS off-palette": int((gibs_bin == OFF_PALETTE).sum()),
+    }
+    print(f"  titiler: {seconds:.1f}s")
+    print("  pixels: " + ", ".join(f"{k} {v:,}" for k, v in counts.items()))
+    if diff.size:
+        same, near = np.mean(diff == 0), np.mean(diff <= 1)
+        print(f"  same bin {same:.1%}, within 1 bin {near:.1%}")
 
     stamp = np.datetime_as_string(utc, unit="s").replace(":", "")
     out = args.out or f"where-{args.collection}-{stamp}.png"
     title = f"{args.collection.upper()} {variable}  scan {utc}Z  where " + " & ".join(
         WHERE
     )
-    plot(out, title, gibs, gibs_bin, bins, colors, [bbox[0], bbox[2], bbox[1], bbox[3]])
+    plot(
+        out,
+        title,
+        gibs,
+        gibs_bin,
+        store_bin,
+        colors,
+        [bbox[0], bbox[2], bbox[1], bbox[3]],
+    )
     print(f"  wrote {out}")
-    if not common:
+    if not counts["both"]:
         print("  no pixels in common with GIBS for this scan or box", file=sys.stderr)
         return 1
-    return 0 if identical else 1
+    return 0
 
 
 if __name__ == "__main__":
