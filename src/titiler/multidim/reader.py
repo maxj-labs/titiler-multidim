@@ -38,6 +38,21 @@ def _log_path(src_path: str) -> str:
     return src_path.split("?", maxsplit=1)[0]
 
 
+def _s3_store_auth(icechunk_style: bool) -> Dict[str, Any]:
+    """Ambient AWS credentials for an s3 store, or unsigned requests if none.
+
+    Without the fallback a host with no AWS configuration (a laptop, CI)
+    cannot open even a public bucket: boto3 finds no credentials and the
+    obstore provider raises. Unsigned requests grant nothing extra.
+    """
+    session = Session()
+    if session.get_credentials() is None:
+        return {"anonymous": True} if icechunk_style else {"skip_signature": True}
+    if icechunk_style:
+        return {"from_env": True}
+    return {"credential_provider": Boto3CredentialProvider(session)}
+
+
 def opener_icechunk(
     src_path: str,
     group: Optional[str] = None,
@@ -64,7 +79,8 @@ def opener_icechunk(
         storage = icechunk.s3_storage(
             bucket=bucket,
             prefix=prefix,
-            from_env=True,  # the store itself always uses ambient credentials
+            # the store itself uses ambient credentials, or none at all
+            **_s3_store_auth(icechunk_style=True),
         )
     else:
         raise NotImplementedError(
@@ -146,7 +162,7 @@ def identify_storage_backend(src_path: str) -> str:
         store = obstore.store.S3Store(
             bucket=parsed.netloc,
             prefix=parsed.path.lstrip("/"),
-            credential_provider=Boto3CredentialProvider(Session()),
+            **_s3_store_auth(icechunk_style=False),
         )
     else:
         raise NotImplementedError(

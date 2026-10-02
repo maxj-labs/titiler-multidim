@@ -13,19 +13,29 @@ class _StopWiring(Exception):
     """Raised by stubs to stop execution once the wiring under test ran."""
 
 
-def test_identify_uses_boto3_provider(monkeypatch):
-    """identify_storage_backend always uses the ambient Boto3 provider for s3."""
-    from obstore.auth.boto3 import Boto3CredentialProvider
-
-    # Boto3CredentialProvider's constructor calls session.get_credentials()
-    # synchronously and raises if it's None; this sandbox has no ambient AWS
-    # credentials (no env vars, no ~/.aws, no IAM role), so without these the
-    # test would fail on that construction before ever reaching the stubbed
-    # S3Store. Setting them locally satisfies botocore's env credential
-    # provider with no network call, matching this file's "stub every
-    # EDL/S3 interaction" convention for the parts of the SDK we don't own.
+@pytest.fixture
+def ambient_aws(monkeypatch):
+    """Ambient AWS credentials, from env vars so botocore makes no network call."""
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
+
+
+@pytest.fixture
+def no_ambient_aws(monkeypatch, tmp_path):
+    """No AWS credentials anywhere botocore looks (env, files, IMDS)."""
+    for name in (
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_PROFILE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(tmp_path / "credentials"))
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(tmp_path / "config"))
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
+
+
+def _capture_s3store(monkeypatch):
     captured = {}
 
     def fake_s3store(**kwargs):
@@ -35,11 +45,10 @@ def test_identify_uses_boto3_provider(monkeypatch):
     monkeypatch.setattr(obstore.store, "S3Store", fake_s3store)
     with pytest.raises(_StopWiring):
         reader.identify_storage_backend("s3://some-random-bucket/f.nc")
-    assert isinstance(captured["credential_provider"], Boto3CredentialProvider)
+    return captured
 
 
-def test_opener_icechunk_uses_from_env_storage(monkeypatch):
-    """opener_icechunk opens s3 stores with from_env (ambient) credentials."""
+def _capture_s3_storage(monkeypatch):
     captured = {}
 
     def fake_s3_storage(**kwargs):
@@ -49,7 +58,37 @@ def test_opener_icechunk_uses_from_env_storage(monkeypatch):
     monkeypatch.setattr(icechunk, "s3_storage", fake_s3_storage)
     with pytest.raises(_StopWiring):
         reader.opener_icechunk("s3://some-random-bucket/repo")
+    return captured
+
+
+def test_identify_uses_boto3_provider(monkeypatch, ambient_aws):
+    """identify_storage_backend uses the ambient Boto3 provider when there is one."""
+    from obstore.auth.boto3 import Boto3CredentialProvider
+
+    captured = _capture_s3store(monkeypatch)
+    assert isinstance(captured["credential_provider"], Boto3CredentialProvider)
+    assert "skip_signature" not in captured
+
+
+def test_identify_unsigned_without_credentials(monkeypatch, no_ambient_aws):
+    """Without ambient credentials, public buckets are listed unsigned."""
+    captured = _capture_s3store(monkeypatch)
+    assert captured["skip_signature"] is True
+    assert "credential_provider" not in captured
+
+
+def test_opener_icechunk_uses_from_env_storage(monkeypatch, ambient_aws):
+    """opener_icechunk opens s3 stores with from_env (ambient) credentials."""
+    captured = _capture_s3_storage(monkeypatch)
     assert captured["from_env"] is True
+    assert "anonymous" not in captured
+
+
+def test_opener_icechunk_anonymous_without_credentials(monkeypatch, no_ambient_aws):
+    """Without ambient credentials, icechunk s3 stores open anonymously."""
+    captured = _capture_s3_storage(monkeypatch)
+    assert captured["anonymous"] is True
+    assert "from_env" not in captured
 
 
 def _tiny_dataset():
