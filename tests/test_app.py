@@ -472,6 +472,17 @@ class TestWhereParameter:
         assert response.status_code == 200
         assert "where=CDD0%3C0.5" in response.json()["tiles"][0]
 
+    def test_more_than_twenty_conditions_is_a_422(self, app):
+        """Each distinct condition variable adds a window read per tile, so
+        the repeatable parameter is bounded like `url` is."""
+        ok = app.get("/point/10,10", params={**self.params, "where": ["CDD0>=0"] * 20})
+        assert ok.status_code == 200
+        too_many = app.get(
+            "/point/10,10", params={**self.params, "where": ["CDD0>=0"] * 21}
+        )
+        assert too_many.status_code == 422
+        assert "where" in str(too_many.json()["detail"])
+
     @pytest.mark.parametrize(
         "condition,detail",
         [

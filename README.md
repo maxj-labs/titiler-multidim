@@ -47,8 +47,9 @@ TiTiler 2 is a breaking API upgrade:
 Every data endpoint accepts a repeatable `where` parameter that masks the
 selected variable by numeric conditions on any variable of the same
 dataset — `{variable}{op}{number}` with op one of `==`, `!=`, `<`, `<=`,
-`>`, `>=`. Conditions are ANDed; pixels failing any condition render as
-nodata (transparent tiles, `null` from `/point`). The condition variables
+`>`, `>=`. Conditions are ANDed (up to twenty per request); pixels failing
+any condition render as nodata (transparent tiles, `null` from `/point`).
+The condition variables
 are sliced with the same `sel` as the main variable, and each distinct
 condition variable adds its chunk reads to the request. `where` converts an
 integer variable to float, because masked pixels are stored as NaN, which

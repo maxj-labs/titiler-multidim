@@ -85,12 +85,16 @@ class MultidimXarrayParams(XarrayParams):
     where: Annotated[
         list[str] | None,
         Query(
+            # each distinct condition variable adds a window read per tile,
+            # so bound the request like `url` (max twenty) is bounded
+            max_length=20,
             description=(
                 "Mask the selected variable by numeric conditions on any "
                 "variable of the same dataset, `{variable}{op}{number}` "
                 "with op one of ==, !=, <, <=, >, >= "
                 "(e.g. `where=main_data_quality_flag==0`). Repeat the "
-                "parameter to AND conditions. Pixels failing any condition "
+                "parameter (up to twenty times) to AND conditions. Pixels "
+                "failing any condition "
                 "render as nodata. URL-encode the value. In a URL, `+` means "
                 "a space, so write `1e5` or `1e%2B5`, not `1e+5`."
             ),
